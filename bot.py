@@ -12,7 +12,8 @@ from telegram.ext import (
     ConversationHandler
 )
 from details import get_details_handler
-
+from setorigin import get_setorigin_handler
+from recommend import get_recommend_handler
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -43,17 +44,14 @@ async def recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Later updated")
 
 
-
-
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("setorigin", setorigin))
-    # app.add_handler(CommandHandler("details", details))
+    app.add_handler(get_setorigin_handler())
     app.add_handler(get_details_handler())
-    app.add_handler(CommandHandler("recommend", recommend))
+    app.add_handler(get_recommend_handler())
     
     print("Bot is running...")
     app.run_polling()
