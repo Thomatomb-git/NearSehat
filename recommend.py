@@ -302,6 +302,7 @@ def _criteria_user_prompt(complaint: str, triage: dict, allowed_tokens: List[str
         "- required_facilities should be minimal but necessary.\n"
         "- preferred_facilities are nice-to-have.\n"
         "- max_distance_km should be smaller for higher urgency.\n"
+        "Remember : always output english despite prompt is not in english\n"
         "Remember: output JSON only."
     )
 
