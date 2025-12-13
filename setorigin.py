@@ -314,11 +314,11 @@ async def setorigin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """
     if _LOAD_ERROR or not _HOSPITALS:
         await update.message.reply_text(
-            "Dataset data1 tidak bisa dibaca.\n"
-            "Pastikan struktur folder kamu:\n"
-            "  bot.py\n"
-            "  setorigin.py\n"
-            "  data/data1.csv\n\n"
+            "Dataset can't be read.\n"
+            # "Pastikan struktur folder kamu:\n"
+            # "  bot.py\n"
+            # "  setorigin.py\n"
+            # "  data/data1.csv\n\n"
             f"(debug) {_LOAD_ERROR or 'no data loaded'}"
         )
         return ConversationHandler.END
@@ -327,16 +327,16 @@ async def setorigin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     current = context.user_data.get("origin_hospital")
     if current and isinstance(current, dict) and current.get("nama") and current.get("kode"):
         await update.message.reply_text(
-            "Origin hospital kamu sekarang:\n"
+            "Your current origin hospital:\n"
             f"- {current['nama']} ({current['kode']})\n\n"
-            "Ketik nama/kode RS lain untuk mengganti, atau /cancel untuk batal."
+            "Type another hospital's keywords/code to change, or /cancel to cancel."
         )
     else:
         await update.message.reply_text(
-            "Set origin hospital (RS tempat kamu berada sekarang).\n\n"
-            "Ketik keyword nama RS (contoh: `cengkareng`, `rsud`, `kembangan`) "
-            "atau ketik `kode` RS.\n\n"
-            "Gunakan /cancel untuk membatalkan."
+            "Set origin hospital.\n\n"
+            "Type the hospital's keywords (example: `cengkareng`, `rsud`, `kembangan`) "
+            "or type hospital's `code`.\n\n"
+            "Click /cancel to cancel."
         )
 
     # Support: /setorigin <keyword> (misal /setorigin cengkareng)
@@ -345,11 +345,11 @@ async def setorigin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         q = " ".join(args)
         options = _search_hospitals(q, limit=10)
         if not options:
-            await update.message.reply_text("Tidak ada match. Coba keyword lain.")
+            await update.message.reply_text("No match, try another keyword.")
             return ORIGIN_QUERY
 
         await update.message.reply_text(
-            "Pilih salah satu opsi berikut:",
+            "Select one of the following options:",
             reply_markup=_options_keyboard(options),
         )
         return ORIGIN_QUERY
@@ -368,7 +368,7 @@ async def setorigin_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """
     if _LOAD_ERROR or not _HOSPITALS:
         await update.message.reply_text(
-            "Dataset data1 tidak tersedia. Cek folder data/data1.csv."
+            "Dataset unavailable. Please check data/data1.csv."
         )
         return ConversationHandler.END
 
@@ -377,13 +377,13 @@ async def setorigin_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if not options:
         await update.message.reply_text(
-            "Tidak ada RS yang cocok.\n"
-            "Coba keyword lain, contoh: `rsud`, `cengkareng`, `kalideres`, atau ketik `kode`."
+            "No suitable hospital.\n"
+            "Try another keyword, example: `rsud`, `cengkareng`, `kalideres`."
         )
         return ORIGIN_QUERY
 
     await update.message.reply_text(
-        "Pilih RS asal kamu dari opsi ini:",
+        "Select your origin hospital from these options:",
         reply_markup=_options_keyboard(options),
     )
     return ORIGIN_QUERY
@@ -408,13 +408,13 @@ async def setorigin_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     data = query.data or ""
     m = re.fullmatch(r"origin:(\d+)", data)
     if not m:
-        await query.edit_message_text("Pilihan tidak valid. Jalankan /setorigin lagi.")
+        await query.edit_message_text("Invalid choice. Run /setorigin again.")
         return ConversationHandler.END
 
     kode = m.group(1)
     h = _BY_KODE.get(kode)
     if not h:
-        await query.edit_message_text("RS tidak ditemukan. Jalankan /setorigin lagi.")
+        await query.edit_message_text("Hospital not found. Run /setorigin again.")
         return ConversationHandler.END
 
     # Simpan origin sementara untuk dipakai /recommend
@@ -427,10 +427,10 @@ async def setorigin_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     }
 
     await query.edit_message_text(
-        "✅ Origin hospital berhasil diset!\n"
+        "✅ Origin hospital successfully set!\n"
         f"- {h.nama} ({h.kode})\n"
         f"- {h.alamat}\n\n"
-        "Next: kamu bisa /details, lalu nanti /recommend."
+        "Next: you can click /details."
     )
 
     return ConversationHandler.END
@@ -440,7 +440,7 @@ async def setorigin_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # Handler: cancel
 # =========================
 async def setorigin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Set origin dibatalkan.")
+    await update.message.reply_text("Set origin cancelled.")
     return ConversationHandler.END
 
 
