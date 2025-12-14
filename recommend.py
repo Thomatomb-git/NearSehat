@@ -108,7 +108,7 @@ def _find_file_or_raise(name_no_ext: str, env_key: Optional[str] = None) -> Path
 
 
 # -----------------------------
-# Normalisasi token fasilitas
+# Normalisasi & pretty-print token fasilitas
 # -----------------------------
 def _norm_token(s: str) -> str:
     """
@@ -121,6 +121,42 @@ def _norm_token(s: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return s.upper()
+
+
+def _pretty_token(token: str) -> str:
+    """
+    Ubah token seperti 'EMERGENCY_ROOM_24_JAM' jadi
+    'Emergency Room 24 Jam', dan jaga akronim pendek (ICU, CT).
+    """
+    token = (token or "").strip()
+    if not token:
+        return ""
+
+    parts = token.split("_")
+    out_parts: List[str] = []
+    for p in parts:
+        if not p:
+            continue
+        if p.isdigit():
+            out_parts.append(p)
+        elif len(p) <= 3 and p.isupper():
+            # Akronim pendek -> tetap kapital (ICU, CT, dll.)
+            out_parts.append(p)
+        else:
+            out_parts.append(p.lower().capitalize())
+    return " ".join(out_parts)
+
+
+def _format_token_list(tokens: List[str]) -> str:
+    """
+    Format list token menjadi string human readable, dipisah koma.
+    Contoh: ['EMERGENCY_ROOM_24_JAM', 'ICU'] ->
+            'Emergency Room 24 Jam, ICU'
+    """
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return "-"
+    return ", ".join(_pretty_token(t) for t in tokens)
 
 
 # -----------------------------
@@ -144,7 +180,9 @@ def load_data1() -> List[Hospital]:
             if not kode or not nama:
                 continue
 
-            hospitals.append(Hospital(kode=kode, nama=nama, jenis=jenis, kelas=kelas, alamat=alamat))
+            hospitals.append(
+                Hospital(kode=kode, nama=nama, jenis=jenis, kelas=kelas, alamat=alamat)
+            )
 
     return hospitals
 
@@ -180,7 +218,7 @@ def load_data2_distances() -> Dict[Tuple[str, str], float]:
 
             try:
                 d = float(d_raw)
-            except:
+            except Exception:
                 continue
 
             dist[(o, t)] = d
@@ -252,7 +290,7 @@ def load_data3_facilities() -> Tuple[Dict[str, FacilityInfo], Set[str]]:
                 if token in ("TOTAL_BEDS", "TOTAL_BED", "BEDS"):
                     try:
                         beds = int(float(str(val).strip()))
-                    except:
+                    except Exception:
                         beds = beds
                     continue
 
@@ -307,7 +345,9 @@ def _criteria_user_prompt(complaint: str, triage: dict, allowed_tokens: List[str
     )
 
 
-async def _call_llm_criteria(complaint: str, triage: dict, allowed_tokens: Set[str]) -> Tuple[bool, dict]:
+async def _call_llm_criteria(
+    complaint: str, triage: dict, allowed_tokens: Set[str]
+) -> Tuple[bool, dict]:
     """
     Call gpt-5-mini via Responses API, JSON mode.
     """
@@ -349,8 +389,10 @@ async def _call_llm_criteria(complaint: str, triage: dict, allowed_tokens: Set[s
         req = data.get("required_facilities", [])
         pref = data.get("preferred_facilities", [])
 
-        if not isinstance(req, list): req = []
-        if not isinstance(pref, list): pref = []
+        if not isinstance(req, list):
+            req = []
+        if not isinstance(pref, list):
+            pref = []
 
         req_norm = []
         for x in req:
@@ -367,12 +409,14 @@ async def _call_llm_criteria(complaint: str, triage: dict, allowed_tokens: Set[s
         maxd = data.get("max_distance_km", 12)
         try:
             maxd = float(maxd)
-        except:
+        except Exception:
             maxd = 12.0
 
         safety_note = str(data.get("safety_note", "")).strip()
         if not safety_note:
-            safety_note = "If symptoms are severe, go to the nearest emergency room immediately."
+            safety_note = (
+                "If symptoms are severe, go to the nearest emergency room immediately."
+            )
 
         return True, {
             "required_facilities": req_norm,
@@ -382,7 +426,7 @@ async def _call_llm_criteria(complaint: str, triage: dict, allowed_tokens: Set[s
         }
 
     except Exception as e:
-        return False, {"error": f"LLM error: {e}"}
+        return False, {"error": f"LLM error: {e}"}  
 
 
 # ============================================================
@@ -611,49 +655,57 @@ async def recommend_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def _format_choice(tag: str, item: Tuple[float, Hospital, float, int, int, int]) -> str:
         _, h, d, rh, rt, ph = item
-        finfo = fac_by_kode.get(h.kode)
-        facilities = finfo.facilities if finfo else set()
+        finfo_local = fac_by_kode.get(h.kode)
+        facilities = finfo_local.facilities if finfo_local else set()
 
         matched_req = [t for t in required if t in facilities]
         matched_pref = [t for t in preferred if t in facilities]
 
-        lines = []
+        lines: List[str] = []
         lines.append(f"{tag}")
         lines.append(f"- {h.nama} ({h.kode})")
         lines.append(f"- Distance from origin: {d:.1f} km")
         lines.append(f"- Address: {h.alamat}")
-        if finfo and finfo.beds is not None:
-            lines.append(f"- Beds: {finfo.beds}")
+        if finfo_local and finfo_local.beds is not None:
+            lines.append(f"- Beds: {finfo_local.beds}")
 
         # Alasan data-based
         if required:
-            lines.append(f"- Required match: {len(matched_req)}/{len(required)} -> {matched_req}")
+            lines.append(
+                f"- Required match: {len(matched_req)}/{len(required)} -> "
+                f"{_format_token_list(matched_req)}"
+            )
         if preferred:
-            lines.append(f"- Preferred match: {len(matched_pref)}/{len(preferred)} -> {matched_pref}")
+            lines.append(
+                f"- Preferred match: {len(matched_pref)}/{len(preferred)} -> "
+                f"{_format_token_list(matched_pref)}"
+            )
 
         return "\n".join(lines)
 
     # 6) output
-    header = []
+    header: List[str] = []
     header.append("🏥 NearSehat Recommendation")
     header.append(f"Origin: {origin.get('nama', '-') } ({origin_kode})")
     header.append(f"Urgency: {urgency}")
-    header.append(f"Criteria: max_distance_km={maxd}")
+    header.append(f"Criteria: Max Distance = {maxd:.1f} km")
     if required:
-        header.append(f"Required: {required}")
+        header.append(f"Required: {_format_token_list(required)}")
     if preferred:
-        header.append(f"Preferred: {preferred}")
+        header.append(f"Preferred: {_format_token_list(preferred)}")
     header.append("")
 
-    out = []
+    out: List[str] = []
     out.append("\n".join(header))
     out.append(_format_choice("✅ Best", best))
     out.append("")
     if alt:
         out.append(_format_choice("⭐ Alternative", alt))
         out.append("")
-    if safety_note:
-        out.append(f"⚠️ Note: {safety_note}")
+
+    # Note dari AI dihilangkan dari output ke user (sesuai permintaan)
+    # if safety_note:
+    #     out.append(f"⚠️ Note: {safety_note}")
 
     # Simpan hasil terakhir (sementara) biar gampang debug
     context.user_data["last_recommendation"] = {

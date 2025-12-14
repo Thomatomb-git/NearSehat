@@ -172,7 +172,7 @@ async def details_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["llm_result"] = json.loads(payload)
 
     # Kirim JSON ke user
-    await update.message.reply_text(f"LLM Output:\n```\n{payload}\n```", parse_mode="Markdown")
+    # await update.message.reply_text(f"LLM Output:\n```\n{payload}\n```", parse_mode="Markdown")
     await update.message.reply_text("Next: use /recommend to get the Best & Alternative hospitals.")
     return ConversationHandler.END
 
