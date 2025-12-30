@@ -1,39 +1,18 @@
 from __future__ import annotations
 
+# recommend.py (deterministic recommender + compact UI payload)
+# Tidak ada LLM di sini. Semua kriteria datang dari details.py (single call).
+# Output ke user harus dalam bahasa Inggris.
+
 import csv
+import html
 import os
 import re
-import json
-import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-
-from openai import OpenAI
-from telegram import Update
-from telegram.ext import CommandHandler, ContextTypes
-
-# ============================================================
-# NearSehat - /recommend
-#
-# Requirements dari kamu:
-# - data1, data2, data3 ada di folder "data/" sejajar bot.py
-# - origin disimpan sementara (context.user_data["origin_hospital"])
-# - hasil /details disimpan sementara (context.user_data["llm_result"], "complaint")
-# - /recommend pakai AI (gpt-5-mini) untuk menyusun kriteria rujukan
-# - selection & ranking RS deterministic pakai CSV (anti-halusinasi)
-# ============================================================
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# Default model sesuai request kamu.
-# Kalau mau override: set env OPENAI_MODEL=gpt-5-mini (atau model lain).
-OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-5-mini"
+from typing import Dict, List, Optional, Set, Tuple, Any
 
 
-# -----------------------------
-# Data model RS dari data1
-# -----------------------------
 @dataclass(frozen=True)
 class Hospital:
     kode: str
@@ -43,685 +22,517 @@ class Hospital:
     alamat: str
 
 
-# -----------------------------
-# Helper path (data folder)
-# -----------------------------
-def _candidate_data_paths(filename_no_ext: str) -> List[Path]:
-    """
-    Cari file di:
-      - <folder script ini>/data/<name>.csv
-      - <folder script ini>/data/<name>
-      - <cwd>/data/<name>.csv
-      - <cwd>/data/<name>
-    plus optional env override:
-      - DATA_DIR
-      - DATA1_PATH / DATA2_PATH / DATA3_PATH (langsung ke file)
-    """
+@dataclass(frozen=True)
+class FacilityInfo:
+    facilities: Set[str]
+    beds: Optional[int] = None
+
+
+DEFAULT_DATA1_NAME = "data1.csv"
+DEFAULT_DATA2_NAME = "data2.csv"
+DEFAULT_DATA3_NAME = "data3.csv"
+
+
+def _resolve_path(env_var: str, filename: str) -> Path:
+    p = os.getenv(env_var)
+    if p:
+        return Path(p).expanduser()
+
+    data_dir = os.getenv("DATA_DIR")
+    if data_dir:
+        return (Path(data_dir).expanduser() / filename)
+
+    candidates = [
+        Path.cwd() / filename,
+        Path.cwd() / "data" / filename,
+    ]
+
     here = Path(__file__).resolve().parent
-    cwd = Path.cwd()
+    candidates.extend([
+        here / filename,
+        here / "data" / filename,
+    ])
 
-    paths: List[Path] = []
+    for c in candidates:
+        if c.exists():
+            return c
 
-    env_dir = os.getenv("DATA_DIR")
-    if env_dir:
-        d = Path(env_dir)
-        paths.append(d / f"{filename_no_ext}.csv")
-        paths.append(d / filename_no_ext)
-
-    # default (sefolder bot.py biasanya)
-    paths.append(here / "data" / f"{filename_no_ext}.csv")
-    paths.append(here / "data" / filename_no_ext)
-
-    # fallback (kalau run dari folder bot.py)
-    paths.append(cwd / "data" / f"{filename_no_ext}.csv")
-    paths.append(cwd / "data" / filename_no_ext)
-
-    # De-dup preserve order
-    seen = set()
-    uniq: List[Path] = []
-    for p in paths:
-        sp = str(p)
-        if sp not in seen:
-            uniq.append(p)
-            seen.add(sp)
-    return uniq
+    return candidates[0]
 
 
-def _find_file_or_raise(name_no_ext: str, env_key: Optional[str] = None) -> Path:
-    """
-    Cari file dataX. Kalau env_key diset dan env var-nya ada, pakai itu.
-    """
-    if env_key:
-        envp = os.getenv(env_key)
-        if envp and Path(envp).exists():
-            return Path(envp)
-
-    for p in _candidate_data_paths(name_no_ext):
-        if p.exists():
-            return p
-
-    tried = "\n".join([f"- {p}" for p in _candidate_data_paths(name_no_ext)])
-    raise FileNotFoundError(
-        f"Cannot find {name_no_ext}.\n"
-        f"Expected: data/{name_no_ext}.csv\n\nTried:\n{tried}"
-    )
-
-
-# -----------------------------
-# Normalisasi & pretty-print token fasilitas
-# -----------------------------
 def _norm_token(s: str) -> str:
-    """
-    Ubah nama kolom fasilitas jadi token stabil:
-      "Emergency room (24 jam) " -> "EMERGENCY_ROOM_24_JAM"
-      "CT-Scan" -> "CT_SCAN"
-      "Stroke Unit" -> "STROKE_UNIT"
-    """
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = (s or "").strip()
+    s = re.sub(r"[^A-Za-z0-9]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return s.upper()
 
 
 def _pretty_token(token: str) -> str:
     """
-    Ubah token seperti 'EMERGENCY_ROOM_24_JAM' jadi
-    'Emergency Room 24 Jam', dan jaga akronim pendek (ICU, CT).
+    Convert token like EMERGENCY_ROOM_24_JAM -> Emergency Room 24 Hours
+    (Khusus 'Jam' kita translate jadi 'Hours' karena output harus English.)
     """
-    token = (token or "").strip()
-    if not token:
-        return ""
-
-    parts = token.split("_")
-    out_parts: List[str] = []
-    for p in parts:
-        if not p:
+    t = (token or "").strip().replace("_", " ").lower()
+    words = []
+    for w in t.split():
+        if not w:
             continue
-        if p.isdigit():
-            out_parts.append(p)
-        elif len(p) <= 3 and p.isupper():
-            # Akronim pendek -> tetap kapital (ICU, CT, dll.)
-            out_parts.append(p)
+        if w == "jam":
+            words.append("Hours")
+        elif w.isdigit():
+            words.append(w)
+        elif len(w) <= 3 and w.isalpha():
+            words.append(w.upper())
         else:
-            out_parts.append(p.lower().capitalize())
-    return " ".join(out_parts)
+            words.append(w.capitalize())
+    return " ".join(words)
 
 
 def _format_token_list(tokens: List[str]) -> str:
-    """
-    Format list token menjadi string human readable, dipisah koma.
-    Contoh: ['EMERGENCY_ROOM_24_JAM', 'ICU'] ->
-            'Emergency Room 24 Jam, ICU'
-    """
-    tokens = [t for t in tokens if t]
     if not tokens:
-        return "-"
+        return "None"
     return ", ".join(_pretty_token(t) for t in tokens)
 
 
-# -----------------------------
-# Load data1 (RS list)
-# -----------------------------
-def load_data1() -> List[Hospital]:
-    p = _find_file_or_raise("data1", env_key="DATA1_PATH")
+def _is_truthy(v: str) -> bool:
+    s = (v or "").strip().lower()
+    return s in {"1", "true", "yes", "y", "ya", "ada", "available", "avail", "t"}
+
+
+def _parse_int_safe(v: str) -> Optional[int]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace(",", "")
+    try:
+        return int(float(s))
+    except Exception:
+        return None
+
+
+def _looks_like_beds_column(col: str) -> bool:
+    c = (col or "").strip().lower()
+    return ("bed" in c and "total" in c) or c in {"beds", "totalbeds", "total_beds", "total bed", "total beds"}
+
+
+_LOADED = False
+_HOSPITALS: List[Hospital] = []
+_DIST: Dict[Tuple[str, str], float] = {}
+_FAC: Dict[str, FacilityInfo] = {}
+_ALLOWED_TOKENS: List[str] = []
+
+
+def _ensure_loaded() -> None:
+    """
+    IMPORTANT BUGFIX:
+    data3.csv header sering punya trailing space (contoh: 'Emergency room (24 jam) ').
+    Kalau header kita .strip() lalu dipakai untuk row.get(...), key-nya tidak match -> facility kebaca kosong.
+    Solusi: akses row.get() pakai header original, token tetap dibuat dari versi stripped.
+    """
+    global _LOADED, _HOSPITALS, _DIST, _FAC, _ALLOWED_TOKENS
+    if _LOADED:
+        return
+
+    # -------------------------
+    # data1.csv
+    # -------------------------
+    p1 = _resolve_path("DATA1_PATH", DEFAULT_DATA1_NAME)
+    if not p1.exists():
+        raise FileNotFoundError(f"data1.csv not found. Tried: {p1}. Set DATA1_PATH or DATA_DIR.")
+
     hospitals: List[Hospital] = []
-
-    with p.open("r", encoding="utf-8-sig", newline="") as f:
+    with p1.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("data1.csv has no header row.")
+
+        fieldnames_stripped = {h.strip() for h in reader.fieldnames}
+        required_cols = {"kode", "nama", "jenis", "kelas", "alamat"}
+        missing = required_cols - fieldnames_stripped
+        if missing:
+            raise ValueError(f"data1.csv missing columns: {sorted(missing)}")
+
         for row in reader:
-            row_l = {str(k).strip().lower(): v for k, v in (row or {}).items()}
-
-            kode = str(row_l.get("kode", "")).strip()
-            nama = str(row_l.get("nama", "")).strip()
-            jenis = str(row_l.get("jenis", "")).strip()
-            kelas = str(row_l.get("kelas", "")).strip()
-            alamat = str(row_l.get("alamat", "")).strip()
-
-            if not kode or not nama:
+            kode = str(row.get("kode", "")).strip()
+            if not kode:
                 continue
-
             hospitals.append(
-                Hospital(kode=kode, nama=nama, jenis=jenis, kelas=kelas, alamat=alamat)
+                Hospital(
+                    kode=kode,
+                    nama=str(row.get("nama", "")).strip(),
+                    jenis=str(row.get("jenis", "")).strip(),
+                    kelas=str(row.get("kelas", "")).strip(),
+                    alamat=str(row.get("alamat", "")).strip(),
+                )
             )
 
-    return hospitals
-
-
-# -----------------------------
-# Load data2 (distance: origin->target)
-# Expected format (dari file kamu yang dulu):
-#   origin,target,distance
-# -----------------------------
-def load_data2_distances() -> Dict[Tuple[str, str], float]:
-    p = _find_file_or_raise("data2", env_key="DATA2_PATH")
+    # -------------------------
+    # data2.csv
+    # -------------------------
+    p2 = _resolve_path("DATA2_PATH", DEFAULT_DATA2_NAME)
+    if not p2.exists():
+        raise FileNotFoundError(f"data2.csv not found. Tried: {p2}. Set DATA2_PATH or DATA_DIR.")
 
     dist: Dict[Tuple[str, str], float] = {}
-    with p.open("r", encoding="utf-8-sig", newline="") as f:
+    with p2.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        headers = [h.strip().lower() for h in (reader.fieldnames or [])]
-
-        # Format yang kita dukung:
-        # - origin/target/distance
-        if not (("origin" in headers) and ("target" in headers) and ("distance" in headers)):
-            raise ValueError(
-                "data2 format not recognized. Expected headers: origin,target,distance"
-            )
+        if not reader.fieldnames:
+            raise ValueError("data2.csv has no header row.")
+        fieldnames_stripped = {h.strip() for h in reader.fieldnames}
+        required_cols = {"origin", "target", "distance"}
+        missing = required_cols - fieldnames_stripped
+        if missing:
+            raise ValueError(f"data2.csv missing columns: {sorted(missing)}")
 
         for row in reader:
-            row_l = {str(k).strip().lower(): v for k, v in (row or {}).items()}
-            o = str(row_l.get("origin", "")).strip()
-            t = str(row_l.get("target", "")).strip()
-            d_raw = str(row_l.get("distance", "")).strip()
-
-            if not o or not t or not d_raw:
+            o = str(row.get("origin", "")).strip()
+            t = str(row.get("target", "")).strip()
+            d = str(row.get("distance", "")).strip()
+            if not o or not t or not d:
                 continue
-
             try:
-                d = float(d_raw)
+                dist[(o, t)] = float(d)
             except Exception:
                 continue
 
-            dist[(o, t)] = d
+    # -------------------------
+    # data3.csv
+    # -------------------------
+    p3 = _resolve_path("DATA3_PATH", DEFAULT_DATA3_NAME)
+    if not p3.exists():
+        raise FileNotFoundError(f"data3.csv not found. Tried: {p3}. Set DATA3_PATH or DATA_DIR.")
 
-    # Optional: jarak ke diri sendiri = 0
-    for (o, t) in list(dist.keys()):
-        dist[(o, o)] = 0.0
+    fac: Dict[str, FacilityInfo] = {}
+    allowed_tokens_set: Set[str] = set()
 
-    return dist
-
-
-# -----------------------------
-# Load data3 (fasilitas/spesialis)
-# Strategy:
-# - Setiap kolom selain kode/nama dianggap fitur.
-# - value truthy (1/true/yes) -> masuk fasilitas
-# - "Total beds" disimpan sebagai capacity (kalau ada)
-# -----------------------------
-@dataclass
-class FacilityInfo:
-    facilities: Set[str]
-    beds: Optional[int]
-
-
-def _truthy(v: str) -> bool:
-    s = str(v).strip().lower()
-    return s in ("1", "true", "yes", "y", "ya", "iya", "available", "ada")
-
-
-def load_data3_facilities() -> Tuple[Dict[str, FacilityInfo], Set[str]]:
-    p = _find_file_or_raise("data3", env_key="DATA3_PATH")
-
-    by_kode: Dict[str, FacilityInfo] = {}
-    all_tokens: Set[str] = set()
-
-    with p.open("r", encoding="utf-8-sig", newline="") as f:
+    with p3.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        fields = [c for c in (reader.fieldnames or [])]
+        if not reader.fieldnames:
+            raise ValueError("data3.csv has no header row.")
 
-        # Cari kolom kode (wajib)
-        # Kita toleran: "kode" / "Kode" / dst.
-        code_col = None
-        name_col = None
-        for c in fields:
-            cl = c.strip().lower()
-            if cl == "kode":
-                code_col = c
-            if cl == "nama":
-                name_col = c
-        if not code_col:
-            raise ValueError("data3 must contain 'kode' column")
+        original_fieldnames = list(reader.fieldnames)
+        pairs = [(orig, orig.strip()) for orig in original_fieldnames]
+
+        def find_col(canonical: str) -> str:
+            for orig, stripped in pairs:
+                if stripped.lower() == canonical.lower():
+                    return orig
+            raise ValueError(f"data3.csv missing required column: '{canonical}'")
+
+        kode_col = find_col("kode")
+
+        beds_col_orig: Optional[str] = None
+        for orig, stripped in pairs:
+            if _looks_like_beds_column(stripped):
+                beds_col_orig = orig
+                break
+
+        facility_cols_orig: List[str] = []
+        facility_tokens: List[str] = []
+
+        for orig, stripped in pairs:
+            if stripped.lower() in {"kode", "nama"}:
+                continue
+            if beds_col_orig and orig == beds_col_orig:
+                continue
+
+            facility_cols_orig.append(orig)
+            tok = _norm_token(stripped)
+            facility_tokens.append(tok)
+            allowed_tokens_set.add(tok)
 
         for row in reader:
-            kode = str(row.get(code_col, "")).strip()
+            kode = str(row.get(kode_col, "")).strip()
             if not kode:
                 continue
 
-            facilities: Set[str] = set()
-            beds: Optional[int] = None
+            beds = None
+            if beds_col_orig:
+                beds = _parse_int_safe(row.get(beds_col_orig, ""))
 
-            for col in fields:
-                if col == code_col or (name_col and col == name_col):
-                    continue
+            s: Set[str] = set()
+            for orig, tok in zip(facility_cols_orig, facility_tokens):
+                if _is_truthy(str(row.get(orig, ""))):
+                    s.add(tok)
 
-                val = row.get(col, "")
-                token = _norm_token(col)
+            fac[kode] = FacilityInfo(facilities=s, beds=beds)
 
-                # Total beds -> numeric feature
-                if token in ("TOTAL_BEDS", "TOTAL_BED", "BEDS"):
-                    try:
-                        beds = int(float(str(val).strip()))
-                    except Exception:
-                        beds = beds
-                    continue
-
-                # boolean facility/specialty
-                if _truthy(val):
-                    facilities.add(token)
-                    all_tokens.add(token)
-
-            by_kode[kode] = FacilityInfo(facilities=facilities, beds=beds)
-
-    return by_kode, all_tokens
+    _HOSPITALS = hospitals
+    _DIST = dist
+    _FAC = fac
+    _ALLOWED_TOKENS = sorted(allowed_tokens_set)
+    _LOADED = True
 
 
-# ============================================================
-# AI step: translate details -> criteria JSON (required/preferred/max_distance)
-#
-# Penting:
-# - kita pakai JSON mode di Responses API:
-#     text={"format": {"type": "json_object"}}
-# - prompt harus mengandung kata "JSON" (rule dari JSON mode)
-# ============================================================
-def _criteria_system_prompt() -> str:
-    return (
-        "You are a hospital referral criteria generator designed to output JSON only. "
-        "You will receive: (1) user's complaint, (2) triage JSON (services, urgency), "
-        "and (3) a list of allowed facility tokens. "
-        "Output a STRICT JSON object with keys:\n"
-        "required_facilities (array of strings),\n"
-        "preferred_facilities (array of strings),\n"
-        "max_distance_km (number),\n"
-        "safety_note (string, one sentence).\n"
-        "Use ONLY tokens from the allowed list. Return JSON only."
-    )
+def get_allowed_facility_tokens() -> List[str]:
+    _ensure_loaded()
+    return list(_ALLOWED_TOKENS)
 
 
-def _criteria_user_prompt(complaint: str, triage: dict, allowed_tokens: List[str]) -> str:
-    # Kita kasih token yang boleh dipakai supaya model nggak ngarang fasilitas.
-    # Karena dataset kamu kecil, ini aman.
-    return (
-        "Complaint:\n"
-        f"{complaint}\n\n"
-        f"Triage JSON:\n{json.dumps(triage, ensure_ascii=False)}\n\n"
-        "Allowed facility tokens:\n"
-        f"{allowed_tokens}\n\n"
-        "Rules:\n"
-        "- If urgency is high, prioritize Emergency room and ICU related needs.\n"
-        "- required_facilities should be minimal but necessary.\n"
-        "- preferred_facilities are nice-to-have.\n"
-        "- max_distance_km should be smaller for higher urgency.\n"
-        "Remember : always output english despite prompt is not in english\n"
-        "Remember: output JSON only."
-    )
-
-
-async def _call_llm_criteria(
-    complaint: str, triage: dict, allowed_tokens: Set[str]
-) -> Tuple[bool, dict]:
-    """
-    Call gpt-5-mini via Responses API, JSON mode.
-    """
-    if not OPENAI_API_KEY:
-        return False, {"error": "OPENAI_API_KEY is not set."}
-
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    # Batasi token list biar prompt nggak bengkak
-    allowed_sorted = sorted(list(allowed_tokens))
-    allowed_sorted = allowed_sorted[:500]  # dataset kamu kecil, ini biasanya sudah cukup
-
-    def _req():
-        # JSON mode: text.format json_object (lihat docs)
-        # https://platform.openai.com/docs/guides/structured-outputs#json-mode
-        return client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": _criteria_system_prompt()},
-                {
-                    "role": "user",
-                    "content": _criteria_user_prompt(complaint, triage, allowed_sorted),
-                },
-            ],
-            text={"format": {"type": "json_object"}},
-        )
-
-    try:
-        rsp = await asyncio.get_running_loop().run_in_executor(None, _req)
-        raw = (rsp.output_text or "").strip()
-        if not raw:
-            return False, {"error": "Empty model output."}
-
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            return False, {"error": "Model returned non-object JSON."}
-
-        # Normalize & sanitize
-        req = data.get("required_facilities", [])
-        pref = data.get("preferred_facilities", [])
-
-        if not isinstance(req, list):
-            req = []
-        if not isinstance(pref, list):
-            pref = []
-
-        req_norm = []
-        for x in req:
-            t = _norm_token(str(x))
-            if t in allowed_tokens:
-                req_norm.append(t)
-
-        pref_norm = []
-        for x in pref:
-            t = _norm_token(str(x))
-            if t in allowed_tokens and t not in req_norm:
-                pref_norm.append(t)
-
-        maxd = data.get("max_distance_km", 12)
-        try:
-            maxd = float(maxd)
-        except Exception:
-            maxd = 12.0
-
-        safety_note = str(data.get("safety_note", "")).strip()
-        if not safety_note:
-            safety_note = (
-                "If symptoms are severe, go to the nearest emergency room immediately."
-            )
-
-        return True, {
-            "required_facilities": req_norm,
-            "preferred_facilities": pref_norm,
-            "max_distance_km": maxd,
-            "safety_note": safety_note,
-        }
-
-    except Exception as e:
-        return False, {"error": f"LLM error: {e}"}  
-
-
-# ============================================================
-# Deterministic fallback (kalau AI gagal)
-# ============================================================
-def _fallback_criteria(triage: dict, allowed_tokens: Set[str]) -> dict:
-    """
-    Kalau AI down, kita tetap bisa jalan pakai mapping sederhana.
-    triage berasal dari /details (services + urgency).
-    """
-    urgency = str(triage.get("urgency", "medium")).strip().lower()
-    services = triage.get("services", [])
-    if not isinstance(services, list):
-        services = []
-
-    # Map service -> token data3 (berdasarkan kolom di data3 kamu)
-    # Token ini harus match _norm_token(col) dari data3.
-    service_map = {
-        "emergency": ["EMERGENCY_ROOM_24_JAM"],
-        "pulmonology": ["PULMONOLOGY"],
-        "cardiology": ["CARDIOLOGY"],
-        "neurology": ["NEUROLOGY"],
-        "orthopedics": ["ORTHOPEDICS"],
-        "obstetrics_gynecology": ["OBSTETRICS_GYNECOLOGY"],
-        "pediatrics": ["PEDIATRICS"],
-        "cathlab": ["CATH_LAB"],
-        "ct_scan_24h": ["CT_SCAN"],
-        "stroke_unit": ["STROKE_UNIT", "CT_SCAN"],
-    }
-
-    required: List[str] = []
-    preferred: List[str] = []
-
-    for s in services:
-        key = str(s).strip().lower()
-        for tok in service_map.get(key, []):
-            if tok in allowed_tokens and tok not in required:
-                required.append(tok)
-
-    # Urgency-based requirements
-    if urgency in ("high", "emergency"):
-        # Pastikan ER + ICU jika tersedia tokennya
-        if "EMERGENCY_ROOM_24_JAM" in allowed_tokens and "EMERGENCY_ROOM_24_JAM" not in required:
-            required.insert(0, "EMERGENCY_ROOM_24_JAM")
-        if "ICU" in allowed_tokens and "ICU" not in required:
-            required.append("ICU")
-
-    # Preferred goodies
-    if "CT_SCAN" in allowed_tokens and "CT_SCAN" not in required:
-        preferred.append("CT_SCAN")
-
-    # Max distance default
-    maxd = 20.0
-    if urgency in ("high", "emergency"):
-        maxd = 10.0
-    elif urgency == "medium":
-        maxd = 15.0
-
-    return {
-        "required_facilities": required,
-        "preferred_facilities": preferred,
-        "max_distance_km": maxd,
-        "safety_note": "If symptoms are severe, go to the nearest emergency room immediately.",
-    }
-
-
-# ============================================================
-# Ranking
-# ============================================================
 def _score_candidate(
-    *,
     dist_km: float,
+    urgency: str,
     required_hits: int,
     required_total: int,
     preferred_hits: int,
     beds: Optional[int],
-    urgency: str,
 ) -> float:
-    """
-    Score lebih tinggi = lebih bagus.
-
-    Ide:
-    - Jarak lebih dekat selalu bagus (apalagi urgent)
-    - Preferred facilities nambah poin
-    - Bed capacity sedikit bantu untuk non-emergency (opsional)
-    """
-    # Urgency weight: makin urgent, penalti jarak makin besar
-    urgency = (urgency or "medium").lower()
-    dist_penalty = dist_km
-    if urgency in ("high", "emergency"):
-        dist_penalty = dist_km * 3.0
-    elif urgency == "medium":
-        dist_penalty = dist_km * 2.0
+    u = (urgency or "medium").strip().lower()
+    if u in {"high", "emergency"}:
+        dist_multiplier = 3.0
+        emergency = True
+    elif u == "low":
+        dist_multiplier = 1.2
+        emergency = False
     else:
-        dist_penalty = dist_km * 1.2
+        dist_multiplier = 2.0
+        emergency = False
 
-    score = 0.0
+    dist_penalty = dist_km * dist_multiplier
 
-    # Required pass is enforced outside; but we still reward “complete match”
+    req_score = 0.0
     if required_total > 0:
-        score += (required_hits / required_total) * 300.0
+        req_score = (required_hits / required_total) * 300.0
 
-    score += preferred_hits * 80.0
-    score -= dist_penalty * 25.0
+    pref_score = preferred_hits * 80.0
+    dist_score = -dist_penalty * 25.0
 
-    # Beds: small nudge
-    if beds is not None and urgency not in ("high", "emergency"):
-        score += min(beds, 500) * 0.08
+    beds_bonus = 0.0
+    if beds is not None and not emergency:
+        beds_bonus = min(beds, 500) * 0.08
 
-    return score
+    return req_score + pref_score + dist_score + beds_bonus
 
 
-# ============================================================
-# Main handler: /recommend
-# ============================================================
-async def recommend_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /recommend:
-    - cek origin sudah diset
-    - cek /details sudah ada
-    - load data1/data2/data3
-    - call AI untuk criteria (required/preferred/max_distance)
-    - rank RS deterministically
-    - output Best + Alternative
-    """
-    msg = update.message
-    if not msg:
-        return
+def _collect_scored(
+    origin_kode: str,
+    maxd: float,
+    urgency: str,
+    required: List[str],
+    preferred: List[str],
+    require_all_required: bool,
+    require_distance: bool,
+) -> List[Dict[str, Any]]:
+    scored: List[Dict[str, Any]] = []
 
-    # 1) prerequisite: origin
-    origin = context.user_data.get("origin_hospital")
-    if not origin or not isinstance(origin, dict) or not origin.get("kode"):
-        await msg.reply_text(
-            "Origin hospital is not set yet.\n"
-            "Please use /setorigin first to choose the hospital you are currently at."
-        )
-        return
-
-    origin_kode = str(origin["kode"]).strip()
-
-    # 2) prerequisite: details
-    triage = context.user_data.get("llm_result")
-    complaint = context.user_data.get("complaint")
-    if not triage or not isinstance(triage, dict) or not complaint:
-        await msg.reply_text(
-            "No /details result found yet.\n"
-            "Please use /details first, then run /recommend."
-        )
-        return
-
-    # 3) load datasets
-    try:
-        hospitals = load_data1()
-        dist = load_data2_distances()
-        fac_by_kode, allowed_tokens = load_data3_facilities()
-    except Exception as e:
-        await msg.reply_text(f"Error loading CSV data: {e}")
-        return
-
-    # 4) AI criteria
-    await msg.reply_text("Analyzing referral criteria with AI ...")
-
-    ok, criteria = await _call_llm_criteria(str(complaint), triage, allowed_tokens)
-    if not ok:
-        # fallback deterministic (biar bot tetap jalan)
-        criteria = _fallback_criteria(triage, allowed_tokens)
-
-    required = criteria.get("required_facilities", [])
-    preferred = criteria.get("preferred_facilities", [])
-    maxd = float(criteria.get("max_distance_km", 12.0))
-    safety_note = str(criteria.get("safety_note", "")).strip()
-
-    urgency = str(triage.get("urgency", "medium")).strip().lower()
-
-    # 5) build candidate list
-    scored: List[Tuple[float, Hospital, float, int, int, int]] = []
-    for h in hospitals:
+    for h in _HOSPITALS:
         if h.kode == origin_kode:
             continue
 
-        d = dist.get((origin_kode, h.kode))
+        d = _DIST.get((origin_kode, h.kode))
         if d is None:
-            continue
+            if require_distance:
+                continue
+            dist_for_score = 999.0
+            distance_km = None
+        else:
+            if d > maxd:
+                continue
+            dist_for_score = float(d)
+            distance_km = float(d)
 
-        # distance filter
-        if d > maxd:
-            continue
+        finfo = _FAC.get(h.kode, FacilityInfo(set(), None))
+        fac_set = finfo.facilities
 
-        finfo = fac_by_kode.get(h.kode)
-        facilities = finfo.facilities if finfo else set()
-        beds = finfo.beds if finfo else None
-
-        # required check (hard filter)
+        matched_required = [t for t in required if t in fac_set]
+        missing_required = [t for t in required if t not in fac_set]
+        required_hits = len(matched_required)
         required_total = len(required)
-        required_hits = sum(1 for t in required if t in facilities)
 
-        if required_total > 0 and required_hits < required_total:
+        if require_all_required and required_total > 0 and required_hits < required_total:
             continue
 
-        preferred_hits = sum(1 for t in preferred if t in facilities)
+        matched_pref = [t for t in preferred if t in fac_set]
+        preferred_hits = len(matched_pref)
 
         score = _score_candidate(
-            dist_km=d,
-            required_hits=required_hits,
-            required_total=max(required_total, 1),
-            preferred_hits=preferred_hits,
-            beds=beds,
+            dist_km=dist_for_score,
             urgency=urgency,
+            required_hits=required_hits,
+            required_total=required_total,
+            preferred_hits=preferred_hits,
+            beds=finfo.beds,
         )
 
-        scored.append((score, h, d, required_hits, required_total, preferred_hits))
+        scored.append({
+            "score": score,
+            "hospital": h,
+            "distance_km": distance_km,
+            "matched_required": matched_required,
+            "missing_required": missing_required,
+            "matched_preferred": matched_pref,
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored
+
+
+def build_recommendation_payload(origin_kode: str, origin_name: str, criteria: Dict[str, Any]) -> Dict[str, Any]:
+    _ensure_loaded()
+
+    urgency = str(criteria.get("urgency", "medium")).strip().lower()
+    required: List[str] = [str(x) for x in (criteria.get("required_facilities") or [])]
+    preferred: List[str] = [str(x) for x in (criteria.get("preferred_facilities") or [])]
+    maxd_initial = float(criteria.get("max_distance_km", 12.0))
+    safety = str(criteria.get("safety_note", "")).strip()
+
+    if maxd_initial <= 0:
+        maxd_initial = 12.0
+    if maxd_initial > 100:
+        maxd_initial = 100.0
+
+    notes: List[str] = []
+    maxd_used = maxd_initial
+    relaxed = False
+
+    scored = _collect_scored(origin_kode, maxd_used, urgency, required, preferred, True, True)
 
     if not scored:
-        await msg.reply_text(
-            "No hospitals matched your criteria within the distance limit.\n"
-            f"- Max distance: {maxd} km\n"
-            f"- Required: {required}\n\n"
-            "Try running /details again with a more detailed description, or set a different origin."
-        )
-        return
+        step = 5.0
+        while maxd_used < 100.0 and not scored:
+            maxd_used = min(100.0, maxd_used + step)
+            scored = _collect_scored(origin_kode, maxd_used, urgency, required, preferred, True, True)
+        if maxd_used > maxd_initial and scored:
+            notes.append(f"Expanded search radius from {maxd_initial:.1f} km to {maxd_used:.1f} km.")
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    if not scored:
+        relaxed = True
+        scored = _collect_scored(origin_kode, maxd_used, urgency, required, preferred, False, True)
+        if scored and required:
+            notes.append("No hospital matched all required facilities. Showing the closest best-effort matches.")
+
+    if not scored:
+        relaxed = True
+        scored = _collect_scored(origin_kode, maxd_used, urgency, required, preferred, False, False)
+        if scored:
+            notes.append("Distance data is missing for your origin. Results are facility-based (distance unknown).")
+
+    if not scored:
+        fallback = next((h for h in _HOSPITALS if h.kode != origin_kode), None)
+        if not fallback:
+            raise RuntimeError("No hospitals loaded from data1.csv.")
+        scored = [{
+            "score": 0.0,
+            "hospital": fallback,
+            "distance_km": None,
+            "matched_required": [],
+            "missing_required": list(required),
+            "matched_preferred": [],
+        }]
+        notes.append("Fallback used due to missing distance/facility data.")
 
     best = scored[0]
-    alt = scored[1] if len(scored) >= 2 else None
+    alt = scored[1] if len(scored) > 1 else None
 
-    def _format_choice(tag: str, item: Tuple[float, Hospital, float, int, int, int]) -> str:
-        _, h, d, rh, rt, ph = item
-        finfo_local = fac_by_kode.get(h.kode)
-        facilities = finfo_local.facilities if finfo_local else set()
-
-        matched_req = [t for t in required if t in facilities]
-        matched_pref = [t for t in preferred if t in facilities]
-
-        lines: List[str] = []
-        lines.append(f"{tag}")
-        lines.append(f"- {h.nama} ({h.kode})")
-        lines.append(f"- Distance from origin: {d:.1f} km")
-        lines.append(f"- Address: {h.alamat}")
-        if finfo_local and finfo_local.beds is not None:
-            lines.append(f"- Beds: {finfo_local.beds}")
-
-        # Alasan data-based
-        if required:
-            lines.append(
-                f"- Required match: {len(matched_req)}/{len(required)} -> "
-                f"{_format_token_list(matched_req)}"
-            )
-        if preferred:
-            lines.append(
-                f"- Preferred match: {len(matched_pref)}/{len(preferred)} -> "
-                f"{_format_token_list(matched_pref)}"
-            )
-
-        return "\n".join(lines)
-
-    # 6) output
-    header: List[str] = []
-    header.append("🏥 NearSehat Recommendation")
-    header.append(f"Origin: {origin.get('nama', '-') } ({origin_kode})")
-    header.append(f"Urgency: {urgency}")
-    header.append(f"Criteria: Max Distance = {maxd:.1f} km")
-    if required:
-        header.append(f"Required: {_format_token_list(required)}")
-    if preferred:
-        header.append(f"Preferred: {_format_token_list(preferred)}")
-    header.append("")
-
-    out: List[str] = []
-    out.append("\n".join(header))
-    out.append(_format_choice("✅ Best", best))
-    out.append("")
-    if alt:
-        out.append(_format_choice("⭐ Alternative", alt))
-        out.append("")
-
-    # Note dari AI dihilangkan dari output ke user (sesuai permintaan)
-    # if safety_note:
-    #     out.append(f"⚠️ Note: {safety_note}")
-
-    # Simpan hasil terakhir (sementara) biar gampang debug
-    context.user_data["last_recommendation"] = {
-        "origin": origin_kode,
-        "criteria": criteria,
-        "best": {"kode": best[1].kode, "distance": best[2]},
-        "alternative": {"kode": alt[1].kode, "distance": alt[2]} if alt else None,
+    return {
+        "origin_name": origin_name,
+        "origin_kode": origin_kode,
+        "urgency": urgency,
+        "required": required,
+        "preferred": preferred,
+        "max_distance_requested": maxd_initial,
+        "max_distance_used": maxd_used,
+        "relaxed_required": relaxed,
+        "safety_note": safety,
+        "notes": notes,
+        "best": best,
+        "alt": alt,
     }
 
-    await msg.reply_text("\n".join(out))
+
+def _urgency_line_html(urgency: str, safety_note: str) -> str:
+    u = (urgency or "medium").strip().lower()
+    if u == "high":
+        emoji = "🚨"
+        label = "High urgency"
+        safety = safety_note or "This may be an emergency — go to the nearest ER or call emergency services immediately."
+    elif u == "low":
+        emoji = "🟢"
+        label = "Low urgency"
+        safety = safety_note or "Monitor symptoms and seek care if they worsen."
+    else:
+        emoji = "🟡"
+        label = "Medium urgency"
+        safety = safety_note or "Seek medical help if symptoms worsen."
+    return f"{emoji} <b>{html.escape(label)}</b> — {html.escape(safety)}"
 
 
-def get_recommend_handler():
-    """
-    Di bot.py:
-        from recommend import get_recommend_handler
-        app.add_handler(get_recommend_handler())
-    """
-    return CommandHandler("recommend", recommend_handler)
+def _format_distance(distance_km: Optional[float]) -> str:
+    if distance_km is None:
+        return "distance unknown"
+    return f"{distance_km:.1f} km"
+
+
+def render_main_message(payload: Dict[str, Any]) -> str:
+    origin_name = str(payload.get("origin_name", "(unknown)"))
+    urgency = str(payload.get("urgency", "medium"))
+    safety = str(payload.get("safety_note", "")).strip()
+
+    best_h: Hospital = payload["best"]["hospital"]
+    best_d = payload["best"]["distance_km"]
+
+    alt = payload.get("alt")
+
+    lines = [
+        _urgency_line_html(urgency, safety),
+        f"<b>Origin:</b> {html.escape(origin_name)}",
+        "",
+        f"✅ <b>Best:</b> {html.escape(best_h.nama)} • {_format_distance(best_d)}",
+    ]
+
+    if alt:
+        alt_h: Hospital = alt["hospital"]
+        alt_d = alt["distance_km"]
+        lines.append(f"⭐ <b>Alt:</b> {html.escape(alt_h.nama)} • {_format_distance(alt_d)}")
+
+    lines.extend([
+        "",
+        "➡️ Tap <b>🧠 Reason</b> or type <b>/reason</b> to see why these hospitals were chosen.",
+    ])
+    return "\n".join(lines)
+
+
+def render_reason_message(payload: Dict[str, Any]) -> str:
+    required = list(payload.get("required", []) or [])
+    preferred = list(payload.get("preferred", []) or [])
+    maxd_req = payload.get("max_distance_requested", 0.0)
+
+    best = payload["best"]
+    alt = payload.get("alt")
+    notes = payload.get("notes", []) or []
+
+    def _block_for(label: str, item: Dict[str, Any]) -> str:
+        h: Hospital = item["hospital"]
+        matched_pref = item.get("matched_preferred", []) or []
+        missing_req = item.get("missing_required", []) or []
+        parts = [f"<b>{html.escape(label)} — {html.escape(h.nama)}</b>"]
+        parts.append(f"Matched: {html.escape(_format_token_list(list(matched_pref)))}")
+        if required:
+            parts.append(f"Missing: {html.escape(_format_token_list(list(missing_req)))}")
+        return "\n".join(parts)
+
+    lines = [
+        "🧠 <b>Reasoning Details</b>",
+        "",
+        "<b>Criteria</b>",
+        f"Required: {html.escape(_format_token_list(required))}",
+        f"Preferred: {html.escape(_format_token_list(preferred))}",
+        "",
+        _block_for("Best", best),
+    ]
+
+    if alt:
+        lines.extend(["", _block_for("Alt", alt)])
+
+    note_lines = []
+    if maxd_req:
+        note_lines.append(f"• Max distance requested: {float(maxd_req):.1f} km")
+    if notes:
+        note_lines.extend([f"• {n}" for n in notes])
+
+    if note_lines:
+        lines.extend(["", "<b>Notes</b>", *[html.escape(x) for x in note_lines]])
+
+    return "\n".join(lines)
